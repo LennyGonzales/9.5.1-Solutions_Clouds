@@ -37,3 +37,8 @@ variable "ssh_cidr" {
     error_message = "ssh_cidr doit être un CIDR IPv4 valide, ex: 203.0.113.7/32."
   }
 }
+
+variable "public_key_path" {
+  type    = string
+  default = "~/.ssh/id_ed25519.pub"
+}

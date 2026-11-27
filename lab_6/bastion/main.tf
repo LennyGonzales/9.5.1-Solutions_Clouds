@@ -72,3 +72,88 @@ resource "aws_vpc_security_group_egress_rule" "all" {
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "-1"
 }
+
+data "aws_caller_identity" "current" {}
+
+data "aws_subnet" "public" {
+  filter {
+    name   = "tag:Name"
+    values = ["${local.prefix}_Public_a"]
+  }
+}
+
+data "aws_ami" "al2" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+}
+
+# Le rôle IAM donne au bastion le droit de lire les paramètres SSM de A, et rien d'autre
+resource "aws_iam_role" "bastion" {
+  name = "${local.prefix}_bastion"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "read_db_params" {
+  name = "read_db_params"
+  role = aws_iam_role.bastion.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
+      Resource = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter${local.ssm_prefix}/*"
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "bastion" {
+  name = "${local.prefix}_bastion"
+  role = aws_iam_role.bastion.name
+}
+
+resource "aws_key_pair" "bastion" {
+  key_name   = "${local.prefix}_bastion"
+  public_key = file(pathexpand(var.public_key_path))
+}
+
+resource "aws_instance" "bastion" {
+  ami                    = data.aws_ami.al2.id
+  instance_type          = "t3.micro"
+  subnet_id              = data.aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.bastion.id]
+  iam_instance_profile   = aws_iam_instance_profile.bastion.name
+  key_name               = aws_key_pair.bastion.key_name
+
+  user_data_replace_on_change = true
+  user_data                   = <<-EOF
+    #!/bin/bash
+    amazon-linux-extras install postgresql14 -y
+
+    # Les identifiants sont lus dans SSM à chaque exécution : le mot de passe n'est jamais écrit sur le disque
+    cat > /home/ec2-user/connect-db.sh <<'SCRIPT'
+    #!/bin/bash
+    p() { aws ssm get-parameter --region ${var.region} --name ${local.ssm_prefix}/$1 --with-decryption --query Parameter.Value --output text; }
+    PGPASSWORD=$(p password) exec psql -h $(p endpoint) -p $(p port) -U $(p username) -d $(p name)
+    SCRIPT
+    chown ec2-user:ec2-user /home/ec2-user/connect-db.sh
+    chmod 700 /home/ec2-user/connect-db.sh
+  EOF
+
+  tags = {
+    Name = "${local.prefix}_bastion"
+  }
+}
